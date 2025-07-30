@@ -3,7 +3,6 @@ pragma solidity 0.8.30;
 
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {Address} from "@openzeppelin/contracts/utils/Address.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 
 /**
@@ -36,12 +35,6 @@ interface IToken {
      * @return True if the address is a merchant, false otherwise.
      */
     function isMerchant(address merchant) external view returns (bool);
-
-    /**
-     * @notice Withdraws tokens or ETH from the Token contract.
-     * @param token The token address to withdraw (address(0) for ETH).
-     */
-    function withdrawTokensAndETH(address token) external;
 }
 
 /**
@@ -163,18 +156,6 @@ contract Share is ERC20, ReentrancyGuard {
     }
 
     /**
-     * @notice Structure for withdraw proposals.
-     * @dev Contains voting status, power, token address, initiator, and deadline.
-     */
-    struct withdrawProposal {
-        bool voting;         // Whether the proposal is active for voting.
-        uint256 votingPower; // Accumulated voting power.
-        address tokenAddr;   // Token to withdraw (address(0) for ETH).
-        address initiator;   // Address that initiated the proposal.
-        uint256 deadline;    // Proposal expiration timestamp.
-    }
-
-    /**
      * @notice The most recent add merchant proposal.
      * @dev Public for transparency and querying.
      */
@@ -193,58 +174,16 @@ contract Share is ERC20, ReentrancyGuard {
     changeProposal public recentChange;
 
     /**
-     * @notice The most recent withdraw proposal.
-     * @dev Public for transparency and querying.
-     */
-    withdrawProposal public recentWithdraw;
-
-    /**
-     * @notice Current ID counter for add proposals.
+     * @notice Current ID counter for proposals.
      * @dev Increments with each new add proposal.
      */
-    uint256 public currentAddID;
-
-    /**
-     * @notice Current ID counter for mod proposals.
-     * @dev Increments with each new mod proposal.
-     */
-    uint256 public currentModID;
-
-    /**
-     * @notice Current ID counter for change proposals.
-     * @dev Increments with each new change proposal.
-     */
-    uint256 public currentChangeID;
-
-    /**
-     * @notice Current ID counter for withdraw proposals.
-     * @dev Increments with each new withdraw proposal.
-     */
-    uint256 public currentWithdrawID;
+    uint256 public proposalId;
 
     /**
      * @notice Mapping to track if an address has voted on a specific add proposal ID.
      * @dev Nested mapping for proposal ID to voter address to voted status.
      */
-    mapping(uint256 proposalId => mapping(address voter => bool voted)) public hasVotedAdd;
-
-    /**
-     * @notice Mapping to track if an address has voted on a specific mod proposal ID.
-     * @dev Nested mapping for proposal ID to voter address to voted status.
-     */
-    mapping(uint256 proposalId => mapping(address voter => bool voted)) public hasVotedMod;
-
-    /**
-     * @notice Mapping to track if an address has voted on a specific change proposal ID.
-     * @dev Nested mapping for proposal ID to voter address to voted status.
-     */
-    mapping(uint256 proposalId => mapping(address voter => bool voted)) public hasVotedChange;
-
-    /**
-     * @notice Mapping to track if an address has voted on a specific withdraw proposal ID.
-     * @dev Nested mapping for proposal ID to voter address to voted status.
-     */
-    mapping(uint256 proposalId => mapping(address voter => bool voted)) public hasVotedWithdraw;
+    mapping(uint256 proposalId => mapping(address voter => bool voted)) public hasVoted;
 
     /**
      * @notice Emitted when a new proposal is initiated.
@@ -299,19 +238,18 @@ contract Share is ERC20, ReentrancyGuard {
         }
         if (recentAdd.voting && block.timestamp > recentAdd.deadline) {
             recentAdd.voting = false;
-            emit ProposalEnded("Add", currentAddID, false);
+            emit ProposalEnded("Add", proposalId, false);
         }
-        currentAddID++;
+        proposalId++;
         recentAdd.voting = true;
         recentAdd.votingPower = balanceOf(_msgSender());
         recentAdd.printQuota = actualPrintQuota;
         recentAdd.merchantAddr = merchantAddr;
         recentAdd.merchantName = merchantName;
         recentAdd.deadline = block.timestamp + PROPOSAL_DURATION;
-
-        hasVotedAdd[currentAddID][_msgSender()] = true;
-        emit ProposalInitiated("Add", currentAddID, _msgSender());
-        emit Voted("Add", currentAddID, _msgSender(), balanceOf(_msgSender()));
+        hasVoted[proposalId][_msgSender()] = true;
+        emit ProposalInitiated("Add", proposalId, _msgSender());
+        emit Voted("Add", proposalId, _msgSender(), balanceOf(_msgSender()));
         _checkAndExecuteAdd();
     }
 
@@ -337,9 +275,9 @@ contract Share is ERC20, ReentrancyGuard {
         }
         if (recentMod.voting && block.timestamp > recentMod.deadline) {
             recentMod.voting = false;
-            emit ProposalEnded("Mod", currentModID, false);
+            emit ProposalEnded("Mod", proposalId, false);
         }
-        currentModID++;
+        proposalId++;
         recentMod.voting = true;
         recentMod.votingPower = balanceOf(_msgSender());
         recentMod.printQuota = actualPrintQuota;
@@ -348,10 +286,9 @@ contract Share is ERC20, ReentrancyGuard {
         recentMod.newGuardian = newGuardian;
         recentMod.isFreeze = isFreeze;
         recentMod.deadline = block.timestamp + PROPOSAL_DURATION;
-
-        hasVotedMod[currentModID][_msgSender()] = true;
-        emit ProposalInitiated("Mod", currentModID, _msgSender());
-        emit Voted("Mod", currentModID, _msgSender(), balanceOf(_msgSender()));
+        hasVoted[proposalId][_msgSender()] = true;
+        emit ProposalInitiated("Mod", proposalId, _msgSender());
+        emit Voted("Mod", proposalId, _msgSender(), balanceOf(_msgSender()));
         _checkAndExecuteMod();
     }
 
@@ -366,45 +303,17 @@ contract Share is ERC20, ReentrancyGuard {
         if (!(newPercentage > 0 && newPercentage <= 30)) revert InvalidPercentage();
         if (recentChange.voting && block.timestamp > recentChange.deadline) {
             recentChange.voting = false;
-            emit ProposalEnded("Change", currentChangeID, false);
+            emit ProposalEnded("Change", proposalId, false);
         }
-        currentChangeID++;
+        proposalId++;
         recentChange.voting = true;
         recentChange.votingPower = balanceOf(_msgSender());
         recentChange.newPercentage = newPercentage;
         recentChange.deadline = block.timestamp + PROPOSAL_DURATION;
-
-        hasVotedChange[currentChangeID][_msgSender()] = true;
-        emit ProposalInitiated("Change", currentChangeID, _msgSender());
-        emit Voted("Change", currentChangeID, _msgSender(), balanceOf(_msgSender()));
+        hasVoted[proposalId][_msgSender()] = true;
+        emit ProposalInitiated("Change", proposalId, _msgSender());
+        emit Voted("Change", proposalId, _msgSender(), balanceOf(_msgSender()));
         _checkAndExecuteChange();
-    }
-
-    /**
-     * @notice Initiates a new withdraw proposal.
-     * @dev Requires the initiator to hold SHARE tokens and no active proposals.
-     * @param tokenAddr The token to withdraw (address(0) for ETH).
-     */
-    function initiateWithdraw(address tokenAddr) external nonReentrant {
-        if (balanceOf(_msgSender()) == 0) revert MustHoldShareTokens();
-        if (isAnyProposalActive()) revert OngoingProposal();
-
-        if (recentWithdraw.voting && block.timestamp > recentWithdraw.deadline) {
-            recentWithdraw.voting = false;
-            emit ProposalEnded("Withdraw", currentWithdrawID, false);
-        }
-
-        currentWithdrawID++;
-        recentWithdraw.voting = true;
-        recentWithdraw.votingPower = balanceOf(_msgSender());
-        recentWithdraw.tokenAddr = tokenAddr;
-        recentWithdraw.initiator = _msgSender();
-        recentWithdraw.deadline = block.timestamp + PROPOSAL_DURATION;
-
-        hasVotedWithdraw[currentWithdrawID][_msgSender()] = true;
-        emit ProposalInitiated("Withdraw", currentWithdrawID, _msgSender());
-        emit Voted("Withdraw", currentWithdrawID, _msgSender(), balanceOf(_msgSender()));
-        _checkAndExecuteWithdraw();
     }
 
     /**
@@ -415,11 +324,10 @@ contract Share is ERC20, ReentrancyGuard {
         if (!recentAdd.voting) revert NoOngoingProposal("Add");
         if (block.timestamp > recentAdd.deadline) revert ProposalExpired();
         if (balanceOf(_msgSender()) == 0) revert MustHoldShareTokens();
-        if (hasVotedAdd[currentAddID][_msgSender()]) revert AlreadyVoted();
-
-        hasVotedAdd[currentAddID][_msgSender()] = true;
+        if (hasVoted[proposalId][_msgSender()]) revert AlreadyVoted();
+        hasVoted[proposalId][_msgSender()] = true;
         recentAdd.votingPower += balanceOf(_msgSender());
-        emit Voted("Add", currentAddID, _msgSender(), balanceOf(_msgSender()));
+        emit Voted("Add", proposalId, _msgSender(), balanceOf(_msgSender()));
         _checkAndExecuteAdd();
     }
 
@@ -431,11 +339,10 @@ contract Share is ERC20, ReentrancyGuard {
         if (!recentMod.voting) revert NoOngoingProposal("Mod");
         if (block.timestamp > recentMod.deadline) revert ProposalExpired();
         if (balanceOf(_msgSender()) == 0) revert MustHoldShareTokens();
-        if (hasVotedMod[currentModID][_msgSender()]) revert AlreadyVoted();
-
-        hasVotedMod[currentModID][_msgSender()] = true;
+        if (hasVoted[proposalId][_msgSender()]) revert AlreadyVoted();
+        hasVoted[proposalId][_msgSender()] = true;
         recentMod.votingPower += balanceOf(_msgSender());
-        emit Voted("Mod", currentModID, _msgSender(), balanceOf(_msgSender()));
+        emit Voted("Mod", proposalId, _msgSender(), balanceOf(_msgSender()));
         _checkAndExecuteMod();
     }
 
@@ -447,28 +354,11 @@ contract Share is ERC20, ReentrancyGuard {
         if (!recentChange.voting) revert NoOngoingProposal("Change");
         if (block.timestamp > recentChange.deadline) revert ProposalExpired();
         if (balanceOf(_msgSender()) == 0) revert MustHoldShareTokens();
-        if (hasVotedChange[currentChangeID][_msgSender()]) revert AlreadyVoted();
-
-        hasVotedChange[currentChangeID][_msgSender()] = true;
+        if (hasVoted[proposalId][_msgSender()]) revert AlreadyVoted();
+        hasVoted[proposalId][_msgSender()] = true;
         recentChange.votingPower += balanceOf(_msgSender());
-        emit Voted("Change", currentChangeID, _msgSender(), balanceOf(_msgSender()));
+        emit Voted("Change", proposalId, _msgSender(), balanceOf(_msgSender()));
         _checkAndExecuteChange();
-    }
-
-    /**
-     * @notice Votes on the current withdraw proposal.
-     * @dev Requires an active proposal, valid deadline, holder of SHARE tokens, and not already voted.
-     */
-    function voteWithdraw() external nonReentrant {
-        if (!recentWithdraw.voting) revert NoOngoingProposal("Withdraw");
-        if (block.timestamp > recentWithdraw.deadline) revert ProposalExpired();
-        if (balanceOf(_msgSender()) == 0) revert MustHoldShareTokens();
-        if (hasVotedWithdraw[currentWithdrawID][_msgSender()]) revert AlreadyVoted();
-
-        hasVotedWithdraw[currentWithdrawID][_msgSender()] = true;
-        recentWithdraw.votingPower += balanceOf(_msgSender());
-        emit Voted("Withdraw", currentWithdrawID, _msgSender(), balanceOf(_msgSender()));
-        _checkAndExecuteWithdraw();
     }
 
     /**
@@ -485,8 +375,8 @@ contract Share is ERC20, ReentrancyGuard {
             addMerchant(recentAdd.printQuota, recentAdd.merchantAddr, recentAdd.merchantName);
             recentAdd.voting = false;
             _mint(recentAdd.merchantAddr, totalSupply() / 1000); // mint 0.1% $share of the totalsupply to new merchant
-            emit ProposalExecuted("Add", currentAddID);
-            emit ProposalEnded("Add", currentAddID, true);
+            emit ProposalExecuted("Add", proposalId);
+            emit ProposalEnded("Add", proposalId, true);
         }
     }
 
@@ -503,8 +393,8 @@ contract Share is ERC20, ReentrancyGuard {
         if (recentMod.votingPower >= threshold) {
             modMerchant(recentMod.merchantAddr, recentMod.newGuardian, recentMod.isFreeze, recentMod.printQuota, recentMod.spendingRebate);
             recentMod.voting = false;
-            emit ProposalExecuted("Mod", currentModID);
-            emit ProposalEnded("Mod", currentModID, true);
+            emit ProposalExecuted("Mod", proposalId);
+            emit ProposalEnded("Mod", proposalId, true);
         }
     }
 
@@ -521,38 +411,8 @@ contract Share is ERC20, ReentrancyGuard {
         if (recentChange.votingPower >= threshold) {
             majorityPercentage = recentChange.newPercentage;
             recentChange.voting = false;
-            emit ProposalExecuted("Change", currentChangeID);
-            emit ProposalEnded("Change", currentChangeID, true);
-        }
-    }
-
-    /**
-     * @notice Internal function to check and execute the withdraw proposal if threshold met.
-     * @dev Called after votes; withdraws tokens/ETH to initiator.
-     */
-    function _checkAndExecuteWithdraw() private {
-        if (totalSupply() == 0) revert TotalSupplyZero();
-        if (block.timestamp > recentWithdraw.deadline) {
-            return; // Prevent execution if expired
-        }
-        uint256 threshold = (totalSupply() * majorityPercentage) / 100;
-        if (recentWithdraw.votingPower >= threshold) {
-            address token = recentWithdraw.tokenAddr;
-            address initiator = recentWithdraw.initiator;
-            IToken(TOKEN_ADDRESS).withdrawTokensAndETH(token);
-            if (token == address(0)) {
-                if (address(this).balance > 0) {
-                    Address.sendValue(payable(initiator), address(this).balance);
-                }
-            } else {
-                uint256 balance = IERC20(token).balanceOf(address(this));
-                if (balance > 0) {
-                    IERC20(token).transfer(initiator, balance);
-                }
-            }
-            recentWithdraw.voting = false;
-            emit ProposalExecuted("Withdraw", currentWithdrawID);
-            emit ProposalEnded("Withdraw", currentWithdrawID, true);
+            emit ProposalExecuted("Change", proposalId);
+            emit ProposalEnded("Change", proposalId, true);
         }
     }
 
@@ -598,8 +458,7 @@ contract Share is ERC20, ReentrancyGuard {
     function isAnyProposalActive() public view returns (bool) {
         return (recentAdd.voting && block.timestamp <= recentAdd.deadline) ||
                (recentMod.voting && block.timestamp <= recentMod.deadline) ||
-               (recentChange.voting && block.timestamp <= recentChange.deadline) ||
-               (recentWithdraw.voting && block.timestamp <= recentWithdraw.deadline);
+               (recentChange.voting && block.timestamp <= recentChange.deadline);
     }
 
     /**
