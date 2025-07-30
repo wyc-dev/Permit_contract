@@ -3,6 +3,7 @@ pragma solidity 0.8.30;
 
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {Address} from "@openzeppelin/contracts/utils/Address.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 
 /**
@@ -35,6 +36,12 @@ interface IToken {
      * @return True if the address is a merchant, false otherwise.
      */
     function isMerchant(address merchant) external view returns (bool);
+
+    /**
+     * @notice Withdraws tokens or ETH from the Token contract.
+     * @param token The token address to withdraw (address(0) for ETH).
+     */
+    function withdrawTokensAndETH(address token) external;
 }
 
 /**
@@ -156,6 +163,18 @@ contract Share is ERC20, ReentrancyGuard {
     }
 
     /**
+     * @notice Structure for withdraw proposals.
+     * @dev Contains voting status, power, token address, initiator, and deadline.
+     */
+    struct withdrawProposal {
+        bool voting;         // Whether the proposal is active for voting.
+        uint256 votingPower; // Accumulated voting power.
+        address tokenAddr;   // Token to withdraw (address(0) for ETH).
+        address initiator;   // Address that initiated the proposal.
+        uint256 deadline;    // Proposal expiration timestamp.
+    }
+
+    /**
      * @notice The most recent add merchant proposal.
      * @dev Public for transparency and querying.
      */
@@ -172,6 +191,12 @@ contract Share is ERC20, ReentrancyGuard {
      * @dev Public for transparency and querying.
      */
     changeProposal public recentChange;
+
+    /**
+     * @notice The most recent withdraw proposal.
+     * @dev Public for transparency and querying.
+     */
+    withdrawProposal public recentWithdraw;
 
     /**
      * @notice Current ID counter for proposals.
@@ -317,6 +342,31 @@ contract Share is ERC20, ReentrancyGuard {
     }
 
     /**
+     * @notice Initiates a new withdraw proposal.
+     * @dev Requires the initiator to hold SHARE tokens and no active proposals.
+     * @param tokenAddr The token to withdraw (address(0) for ETH).
+     */
+    function initiateWithdraw(address tokenAddr) external nonReentrant {
+        if (balanceOf(_msgSender()) == 0) revert MustHoldShareTokens();
+        if (isAnyProposalActive()) revert OngoingProposal();
+
+        if (recentWithdraw.voting && block.timestamp > recentWithdraw.deadline) {
+            recentWithdraw.voting = false;
+            emit ProposalEnded("Withdraw", proposalId, false);
+        }
+        proposalId++;
+        recentWithdraw.voting = true;
+        recentWithdraw.votingPower = balanceOf(_msgSender());
+        recentWithdraw.tokenAddr = tokenAddr;
+        recentWithdraw.initiator = _msgSender();
+        recentWithdraw.deadline = block.timestamp + PROPOSAL_DURATION;
+        hasVoted[proposalId][_msgSender()] = true;
+        emit ProposalInitiated("Withdraw", proposalId, _msgSender());
+        emit Voted("Withdraw", proposalId, _msgSender(), balanceOf(_msgSender()));
+        _checkAndExecuteWithdraw();
+    }
+
+    /**
      * @notice Votes on the current add merchant proposal.
      * @dev Requires an active proposal, valid deadline, holder of SHARE tokens, and not already voted.
      */
@@ -359,6 +409,21 @@ contract Share is ERC20, ReentrancyGuard {
         recentChange.votingPower += balanceOf(_msgSender());
         emit Voted("Change", proposalId, _msgSender(), balanceOf(_msgSender()));
         _checkAndExecuteChange();
+    }
+
+    /**
+     * @notice Votes on the current withdraw proposal.
+     * @dev Requires an active proposal, valid deadline, holder of SHARE tokens, and not already voted.
+     */
+    function voteWithdraw() external nonReentrant {
+        if (!recentWithdraw.voting) revert NoOngoingProposal("Withdraw");
+        if (block.timestamp > recentWithdraw.deadline) revert ProposalExpired();
+        if (balanceOf(_msgSender()) == 0) revert MustHoldShareTokens();
+        if (hasVoted[proposalId][_msgSender()]) revert AlreadyVoted();
+        hasVoted[proposalId][_msgSender()] = true;
+        recentWithdraw.votingPower += balanceOf(_msgSender());
+        emit Voted("Withdraw", proposalId, _msgSender(), balanceOf(_msgSender()));
+        _checkAndExecuteWithdraw();
     }
 
     /**
@@ -417,6 +482,36 @@ contract Share is ERC20, ReentrancyGuard {
     }
 
     /**
+     * @notice Internal function to check and execute the withdraw proposal if threshold met.
+     * @dev Called after votes; withdraws tokens/ETH to initiator.
+     */
+    function _checkAndExecuteWithdraw() private {
+        if (totalSupply() == 0) revert TotalSupplyZero();
+        if (block.timestamp > recentWithdraw.deadline) {
+            return; // Prevent execution if expired
+        }
+        uint256 threshold = (totalSupply() * majorityPercentage) / 100;
+        if (recentWithdraw.votingPower >= threshold) {
+            address token = recentWithdraw.tokenAddr;
+            address initiator = recentWithdraw.initiator;
+            IToken(TOKEN_ADDRESS).withdrawTokensAndETH(token);
+            if (token == address(0)) {
+                if (address(this).balance > 0) {
+                    Address.sendValue(payable(initiator), address(this).balance);
+                }
+            } else {
+                uint256 balance = IERC20(token).balanceOf(address(this));
+                if (balance > 0) {
+                    IERC20(token).transfer(initiator, balance);
+                }
+            }
+            recentWithdraw.voting = false;
+            emit ProposalExecuted("Withdraw", proposalId);
+            emit ProposalEnded("Withdraw", proposalId, true);
+        }
+    }
+
+    /**
      * @notice Internal function to call addMerchant on the Token contract.
      * @dev Delegates the call to the Token interface.
      * @param printQuota The minting quota.
@@ -458,7 +553,8 @@ contract Share is ERC20, ReentrancyGuard {
     function isAnyProposalActive() public view returns (bool) {
         return (recentAdd.voting && block.timestamp <= recentAdd.deadline) ||
                (recentMod.voting && block.timestamp <= recentMod.deadline) ||
-               (recentChange.voting && block.timestamp <= recentChange.deadline);
+               (recentChange.voting && block.timestamp <= recentChange.deadline) ||
+               (recentWithdraw.voting && block.timestamp <= recentWithdraw.deadline);
     }
 
     /**
