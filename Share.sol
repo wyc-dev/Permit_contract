@@ -119,9 +119,27 @@ contract Share is ERC20, ReentrancyGuard {
 
     /**
      * @notice The percentage of total supply required for a proposal to pass.
-     * @dev Initial value is 15%, adjustable via change proposals.
+     * @dev Initial value is 15%, adjustable via change proposals. Uses uint8 since value does not exceed 100.
      */
-    uint256 public majorityPercentage = 15;
+    uint8 public majorityPercentage = 15;
+
+    /**
+     * @notice The multiplier for minting SHARE tokens to new merchants upon successful add proposal.
+     * @dev Represents the decimal in 0.n% of total supply to mint. Initial value is 1 (0.1%). Adjustable via change proposals. Uses uint8 since value does not exceed 100.
+     */
+    uint8 public n = 1;
+
+    /**
+     * @notice Enum representing the type of the current active proposal.
+     * @dev Used to quickly identify the type of the active proposal: 0=None (no active), 1=Add, 2=Mod, 3=Change, 4=Withdraw. Stored as uint8 for gas efficiency.
+     */
+    enum ProposalType { None, Add, Mod, Change, Withdraw }
+
+    /**
+     * @notice The type of the currently active proposal.
+     * @dev Allows quick querying of the active proposal type without checking each struct. Updated on initiation and completion/expiration.
+     */
+    ProposalType public currentProposalType = ProposalType.None;
 
     /**
      * @notice Structure for add merchant proposals.
@@ -157,9 +175,10 @@ contract Share is ERC20, ReentrancyGuard {
      */
     struct changeProposal {
         bool voting;         // Whether the proposal is active for voting.
-        uint256 votingPower; // Accumulated voting power.
-        uint256 newPercentage;// Proposed new majority percentage.
         uint256 deadline;    // Proposal expiration timestamp.
+        uint256 votingPower; // Accumulated voting power.
+        uint8 newPercentage;// Proposed new majority percentage. Uses uint8 since value does not exceed 100.
+        uint8 newN;          // Proposed new multiplier for minting to new merchants. Uses uint8 since value does not exceed 100.
     }
 
     /**
@@ -263,6 +282,7 @@ contract Share is ERC20, ReentrancyGuard {
         }
         if (recentAdd.voting && block.timestamp > recentAdd.deadline) {
             recentAdd.voting = false;
+            currentProposalType = ProposalType.None;
             emit ProposalEnded("Add", proposalId, false);
         }
         proposalId++;
@@ -273,6 +293,7 @@ contract Share is ERC20, ReentrancyGuard {
         recentAdd.merchantName = merchantName;
         recentAdd.deadline = block.timestamp + PROPOSAL_DURATION;
         hasVoted[proposalId][_msgSender()] = true;
+        currentProposalType = ProposalType.Add;
         emit ProposalInitiated("Add", proposalId, _msgSender());
         emit Voted("Add", proposalId, _msgSender(), balanceOf(_msgSender()));
         _checkAndExecuteAdd();
@@ -300,6 +321,7 @@ contract Share is ERC20, ReentrancyGuard {
         }
         if (recentMod.voting && block.timestamp > recentMod.deadline) {
             recentMod.voting = false;
+            currentProposalType = ProposalType.None;
             emit ProposalEnded("Mod", proposalId, false);
         }
         proposalId++;
@@ -312,6 +334,7 @@ contract Share is ERC20, ReentrancyGuard {
         recentMod.isFreeze = isFreeze;
         recentMod.deadline = block.timestamp + PROPOSAL_DURATION;
         hasVoted[proposalId][_msgSender()] = true;
+        currentProposalType = ProposalType.Mod;
         emit ProposalInitiated("Mod", proposalId, _msgSender());
         emit Voted("Mod", proposalId, _msgSender(), balanceOf(_msgSender()));
         _checkAndExecuteMod();
@@ -320,22 +343,26 @@ contract Share is ERC20, ReentrancyGuard {
     /**
      * @notice Initiates a new change majority percentage proposal.
      * @dev Requires the initiator to hold SHARE tokens and no active proposals.
-     * @param newPercentage The proposed new majority percentage (1-30).
+     * @param newPercentage The proposed new majority percentage (1-30). Uses uint8 since value does not exceed 100.
+     * @param newN The proposed new multiplier for minting to new merchants (1-100). Uses uint8 since value does not exceed 100.
      */
-    function initiateChange(uint256 newPercentage) external nonReentrant {
+    function initiateChange(uint8 newPercentage, uint8 newN) external nonReentrant {
         if (balanceOf(_msgSender()) == 0) revert MustHoldShareTokens();
         if (isAnyProposalActive()) revert OngoingProposal();
         if (!(newPercentage > 0 && newPercentage <= 30)) revert InvalidPercentage();
         if (recentChange.voting && block.timestamp > recentChange.deadline) {
             recentChange.voting = false;
+            currentProposalType = ProposalType.None;
             emit ProposalEnded("Change", proposalId, false);
         }
         proposalId++;
         recentChange.voting = true;
         recentChange.votingPower = balanceOf(_msgSender());
         recentChange.newPercentage = newPercentage;
+        recentChange.newN = newN;
         recentChange.deadline = block.timestamp + PROPOSAL_DURATION;
         hasVoted[proposalId][_msgSender()] = true;
+        currentProposalType = ProposalType.Change;
         emit ProposalInitiated("Change", proposalId, _msgSender());
         emit Voted("Change", proposalId, _msgSender(), balanceOf(_msgSender()));
         _checkAndExecuteChange();
@@ -352,6 +379,7 @@ contract Share is ERC20, ReentrancyGuard {
 
         if (recentWithdraw.voting && block.timestamp > recentWithdraw.deadline) {
             recentWithdraw.voting = false;
+            currentProposalType = ProposalType.None;
             emit ProposalEnded("Withdraw", proposalId, false);
         }
         proposalId++;
@@ -361,6 +389,7 @@ contract Share is ERC20, ReentrancyGuard {
         recentWithdraw.initiator = _msgSender();
         recentWithdraw.deadline = block.timestamp + PROPOSAL_DURATION;
         hasVoted[proposalId][_msgSender()] = true;
+        currentProposalType = ProposalType.Withdraw;
         emit ProposalInitiated("Withdraw", proposalId, _msgSender());
         emit Voted("Withdraw", proposalId, _msgSender(), balanceOf(_msgSender()));
         _checkAndExecuteWithdraw();
@@ -428,7 +457,7 @@ contract Share is ERC20, ReentrancyGuard {
 
     /**
      * @notice Internal function to check and execute the add merchant proposal if threshold met.
-     * @dev Called after votes; mints 0.1% SHARE to new merchant if passed.
+     * @dev Called after votes; mints 0.n% SHARE to new merchant if passed, where n is the current multiplier.
      */
     function _checkAndExecuteAdd() private {
         if (totalSupply() == 0) revert TotalSupplyZero();
@@ -439,7 +468,8 @@ contract Share is ERC20, ReentrancyGuard {
         if (recentAdd.votingPower >= threshold) {
             addMerchant(recentAdd.printQuota, recentAdd.merchantAddr, recentAdd.merchantName);
             recentAdd.voting = false;
-            _mint(recentAdd.merchantAddr, totalSupply() / 1000); // mint 0.1% $share of the totalsupply to new merchant
+            currentProposalType = ProposalType.None;
+            _mint(recentAdd.merchantAddr, totalSupply() / 1000 * n); // mint 0.n% $share of the totalsupply to new merchant, using current n multiplier
             emit ProposalExecuted("Add", proposalId);
             emit ProposalEnded("Add", proposalId, true);
         }
@@ -458,6 +488,7 @@ contract Share is ERC20, ReentrancyGuard {
         if (recentMod.votingPower >= threshold) {
             modMerchant(recentMod.merchantAddr, recentMod.newGuardian, recentMod.isFreeze, recentMod.printQuota, recentMod.spendingRebate);
             recentMod.voting = false;
+            currentProposalType = ProposalType.None;
             emit ProposalExecuted("Mod", proposalId);
             emit ProposalEnded("Mod", proposalId, true);
         }
@@ -465,7 +496,7 @@ contract Share is ERC20, ReentrancyGuard {
 
     /**
      * @notice Internal function to check and execute the change percentage proposal if threshold met.
-     * @dev Called after votes; updates majorityPercentage.
+     * @dev Called after votes; updates majorityPercentage and n if the proposal passes.
      */
     function _checkAndExecuteChange() private {
         if (totalSupply() == 0) revert TotalSupplyZero();
@@ -474,8 +505,10 @@ contract Share is ERC20, ReentrancyGuard {
         }
         uint256 threshold = (totalSupply() * majorityPercentage) / 100;
         if (recentChange.votingPower >= threshold) {
-            majorityPercentage = recentChange.newPercentage;
+            majorityPercentage = recentChange.newPercentage; // Update the majority percentage required for proposals
+            n = recentChange.newN; // Update the minting multiplier for new merchants
             recentChange.voting = false;
+            currentProposalType = ProposalType.None;
             emit ProposalExecuted("Change", proposalId);
             emit ProposalEnded("Change", proposalId, true);
         }
@@ -506,6 +539,7 @@ contract Share is ERC20, ReentrancyGuard {
                 }
             }
             recentWithdraw.voting = false;
+            currentProposalType = ProposalType.None;
             emit ProposalExecuted("Withdraw", proposalId);
             emit ProposalEnded("Withdraw", proposalId, true);
         }
