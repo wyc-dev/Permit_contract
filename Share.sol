@@ -98,6 +98,11 @@ contract Share is ERC20, ReentrancyGuard {
     error TransfersLocked();
 
     /**
+     * @notice Custom error for when the proposal type does not match the requested data.
+     */
+    error WrongProposalType();
+
+    /**
      * @notice Constructor to initialize the SHARE token.
      * @dev Mints 100,000,000 SHARE tokens to the deployer with the standard 18 decimals.
      */
@@ -124,110 +129,40 @@ contract Share is ERC20, ReentrancyGuard {
     uint8 public majorityPercentage = 15;
 
     /**
-     * @notice The multiplier for minting SHARE tokens to new merchants upon successful add proposal.
-     * @dev Represents the decimal in 0.n% of total supply to mint. Initial value is 1 (0.1%). Adjustable via change proposals. Uses uint8 since value does not exceed 100.
-     */
-    uint8 public n = 1;
-
-    /**
-     * @notice Enum representing the type of the current active proposal.
-     * @dev Used to quickly identify the type of the active proposal: 0=None (no active), 1=Add, 2=Mod, 3=Change, 4=Withdraw. Stored as uint8 for gas efficiency.
+     * @notice Enum representing the type of a proposal.
+     * @dev Used to identify the type of proposals: 0=None, 1=Add, 2=Mod, 3=Change, 4=Withdraw.
      */
     enum ProposalType { None, Add, Mod, Change, Withdraw }
 
     /**
-     * @notice The type of the currently active proposal.
-     * @dev Allows quick querying of the active proposal type without checking each struct. Updated on initiation and completion/expiration.
+     * @notice Mapping from proposal ID to its details (stored as bytes to hold serialized data).
+     * @dev Allows storage of proposal details for historical queries. Data is serialized based on type.
      */
-    ProposalType public currentProposalType = ProposalType.None;
+    mapping(uint256 => bytes) public proposalDetails;
 
     /**
-     * @notice Structure for add merchant proposals.
-     * @dev Contains voting status, power, quota, address, name, and deadline.
+     * @notice The ID of the currently active proposal (0 if none).
+     * @dev Used to track the single active proposal at a time.
      */
-    struct addProposal {
-        bool voting;         // Whether the proposal is active for voting.
-        uint256 votingPower; // Accumulated voting power.
-        uint256 printQuota;  // Proposed minting quota.
-        address merchantAddr;// Proposed merchant address.
-        string merchantName; // Proposed merchant name.
-        uint256 deadline;    // Proposal expiration timestamp.
-    }
+    uint256 public currentProposalId;
 
     /**
-     * @notice Structure for modify merchant proposals.
-     * @dev Contains voting status, power, quota, rebate, address, guardian, freeze status, and deadline.
+     * @notice Indicates if there is currently an active proposal (false = none, true = ongoing).
+     * @dev Tracks the status of the active proposal to prevent concurrent proposals.
      */
-    struct modProposal {
-        bool voting;          // Whether the proposal is active for voting.
-        uint256 votingPower;  // Accumulated voting power.
-        uint256 printQuota;   // Updated minting quota.
-        uint256 spendingRebate;// Updated spending rebate rate.
-        address merchantAddr; // Merchant address to modify.
-        address newGuardian;  // New guardian address.
-        bool isFreeze;        // Whether to freeze the merchant.
-        uint256 deadline;     // Proposal expiration timestamp.
-    }
+    bool public activeProposal;
 
     /**
-     * @notice Structure for change majority percentage proposals.
-     * @dev Contains voting status, power, new percentage, and deadline.
+     * @notice Mapping from proposal ID to its type.
+     * @dev Allows quick identification of a proposal's type for historical queries.
      */
-    struct changeProposal {
-        bool voting;         // Whether the proposal is active for voting.
-        uint256 deadline;    // Proposal expiration timestamp.
-        uint256 votingPower; // Accumulated voting power.
-        uint8 newPercentage;// Proposed new majority percentage. Uses uint8 since value does not exceed 100.
-        uint8 newN;          // Proposed new multiplier for minting to new merchants. Uses uint8 since value does not exceed 100.
-    }
+    mapping(uint256 => ProposalType) public proposalTypes;
 
     /**
-     * @notice Structure for withdraw proposals.
-     * @dev Contains voting status, power, token address, initiator, and deadline.
-     */
-    struct withdrawProposal {
-        bool voting;         // Whether the proposal is active for voting.
-        uint256 votingPower; // Accumulated voting power.
-        address tokenAddr;   // Token to withdraw (address(0) for ETH).
-        address initiator;   // Address that initiated the proposal.
-        uint256 deadline;    // Proposal expiration timestamp.
-    }
-
-    /**
-     * @notice The most recent add merchant proposal.
-     * @dev Public for transparency and querying.
-     */
-    addProposal public recentAdd;
-
-    /**
-     * @notice The most recent modify merchant proposal.
-     * @dev Public for transparency and querying.
-     */
-    modProposal public recentMod;
-
-    /**
-     * @notice The most recent change percentage proposal.
-     * @dev Public for transparency and querying.
-     */
-    changeProposal public recentChange;
-
-    /**
-     * @notice The most recent withdraw proposal.
-     * @dev Public for transparency and querying.
-     */
-    withdrawProposal public recentWithdraw;
-
-    /**
-     * @notice Current ID counter for proposals.
-     * @dev Increments with each new add proposal.
-     */
-    uint256 public proposalId;
-
-    /**
-     * @notice Mapping to track if an address has voted on a specific add proposal ID.
+     * @notice Mapping to track if an address has voted on a specific proposal ID.
      * @dev Nested mapping for proposal ID to voter address to voted status.
      */
-    mapping(uint256 proposalId => mapping(address voter => bool voted)) public hasVoted;
+    mapping(uint256 => mapping(address => bool)) public hasVoted;
 
     /**
      * @notice Emitted when a new proposal is initiated.
@@ -280,23 +215,14 @@ contract Share is ERC20, ReentrancyGuard {
                 actualPrintQuota = printQuota;
             }
         }
-        if (recentAdd.voting && block.timestamp > recentAdd.deadline) {
-            recentAdd.voting = false;
-            currentProposalType = ProposalType.None;
-            emit ProposalEnded("Add", proposalId, false);
-        }
-        proposalId++;
-        recentAdd.voting = true;
-        recentAdd.votingPower = balanceOf(_msgSender());
-        recentAdd.printQuota = actualPrintQuota;
-        recentAdd.merchantAddr = merchantAddr;
-        recentAdd.merchantName = merchantName;
-        recentAdd.deadline = block.timestamp + PROPOSAL_DURATION;
-        hasVoted[proposalId][_msgSender()] = true;
-        currentProposalType = ProposalType.Add;
-        emit ProposalInitiated("Add", proposalId, _msgSender());
-        emit Voted("Add", proposalId, _msgSender(), balanceOf(_msgSender()));
-        _checkAndExecuteAdd();
+        currentProposalId++;
+        activeProposal = true;
+        proposalDetails[currentProposalId] = abi.encode(true, balanceOf(_msgSender()), actualPrintQuota, merchantAddr, merchantName, block.timestamp + PROPOSAL_DURATION);
+        proposalTypes[currentProposalId] = ProposalType.Add;
+        hasVoted[currentProposalId][_msgSender()] = true;
+        emit ProposalInitiated("Add", currentProposalId, _msgSender());
+        emit Voted("Add", currentProposalId, _msgSender(), balanceOf(_msgSender()));
+        _checkAndExecuteAdd(currentProposalId);
     }
 
     /**
@@ -319,53 +245,33 @@ contract Share is ERC20, ReentrancyGuard {
                 actualPrintQuota = printQuota;
             }
         }
-        if (recentMod.voting && block.timestamp > recentMod.deadline) {
-            recentMod.voting = false;
-            currentProposalType = ProposalType.None;
-            emit ProposalEnded("Mod", proposalId, false);
-        }
-        proposalId++;
-        recentMod.voting = true;
-        recentMod.votingPower = balanceOf(_msgSender());
-        recentMod.printQuota = actualPrintQuota;
-        recentMod.spendingRebate = spendingRebate;
-        recentMod.merchantAddr = merchantAddr;
-        recentMod.newGuardian = newGuardian;
-        recentMod.isFreeze = isFreeze;
-        recentMod.deadline = block.timestamp + PROPOSAL_DURATION;
-        hasVoted[proposalId][_msgSender()] = true;
-        currentProposalType = ProposalType.Mod;
-        emit ProposalInitiated("Mod", proposalId, _msgSender());
-        emit Voted("Mod", proposalId, _msgSender(), balanceOf(_msgSender()));
-        _checkAndExecuteMod();
+        currentProposalId++;
+        activeProposal = true;
+        proposalDetails[currentProposalId] = abi.encode(true, balanceOf(_msgSender()), actualPrintQuota, spendingRebate, merchantAddr, newGuardian, isFreeze, block.timestamp + PROPOSAL_DURATION);
+        proposalTypes[currentProposalId] = ProposalType.Mod;
+        hasVoted[currentProposalId][_msgSender()] = true;
+        emit ProposalInitiated("Mod", currentProposalId, _msgSender());
+        emit Voted("Mod", currentProposalId, _msgSender(), balanceOf(_msgSender()));
+        _checkAndExecuteMod(currentProposalId);
     }
 
     /**
      * @notice Initiates a new change majority percentage proposal.
      * @dev Requires the initiator to hold SHARE tokens and no active proposals.
      * @param newPercentage The proposed new majority percentage (1-30). Uses uint8 since value does not exceed 100.
-     * @param newN The proposed new multiplier for minting to new merchants (1-100). Uses uint8 since value does not exceed 100.
      */
-    function initiateChange(uint8 newPercentage, uint8 newN) external nonReentrant {
+    function initiateChange(uint8 newPercentage) external nonReentrant {
         if (balanceOf(_msgSender()) == 0) revert MustHoldShareTokens();
         if (isAnyProposalActive()) revert OngoingProposal();
         if (!(newPercentage > 0 && newPercentage <= 30)) revert InvalidPercentage();
-        if (recentChange.voting && block.timestamp > recentChange.deadline) {
-            recentChange.voting = false;
-            currentProposalType = ProposalType.None;
-            emit ProposalEnded("Change", proposalId, false);
-        }
-        proposalId++;
-        recentChange.voting = true;
-        recentChange.votingPower = balanceOf(_msgSender());
-        recentChange.newPercentage = newPercentage;
-        recentChange.newN = newN;
-        recentChange.deadline = block.timestamp + PROPOSAL_DURATION;
-        hasVoted[proposalId][_msgSender()] = true;
-        currentProposalType = ProposalType.Change;
-        emit ProposalInitiated("Change", proposalId, _msgSender());
-        emit Voted("Change", proposalId, _msgSender(), balanceOf(_msgSender()));
-        _checkAndExecuteChange();
+        currentProposalId++;
+        activeProposal = true;
+        proposalDetails[currentProposalId] = abi.encode(true, block.timestamp + PROPOSAL_DURATION, balanceOf(_msgSender()), newPercentage);
+        proposalTypes[currentProposalId] = ProposalType.Change;
+        hasVoted[currentProposalId][_msgSender()] = true;
+        emit ProposalInitiated("Change", currentProposalId, _msgSender());
+        emit Voted("Change", currentProposalId, _msgSender(), balanceOf(_msgSender()));
+        _checkAndExecuteChange(currentProposalId);
     }
 
     /**
@@ -376,23 +282,14 @@ contract Share is ERC20, ReentrancyGuard {
     function initiateWithdraw(address tokenAddr) external nonReentrant {
         if (balanceOf(_msgSender()) == 0) revert MustHoldShareTokens();
         if (isAnyProposalActive()) revert OngoingProposal();
-
-        if (recentWithdraw.voting && block.timestamp > recentWithdraw.deadline) {
-            recentWithdraw.voting = false;
-            currentProposalType = ProposalType.None;
-            emit ProposalEnded("Withdraw", proposalId, false);
-        }
-        proposalId++;
-        recentWithdraw.voting = true;
-        recentWithdraw.votingPower = balanceOf(_msgSender());
-        recentWithdraw.tokenAddr = tokenAddr;
-        recentWithdraw.initiator = _msgSender();
-        recentWithdraw.deadline = block.timestamp + PROPOSAL_DURATION;
-        hasVoted[proposalId][_msgSender()] = true;
-        currentProposalType = ProposalType.Withdraw;
-        emit ProposalInitiated("Withdraw", proposalId, _msgSender());
-        emit Voted("Withdraw", proposalId, _msgSender(), balanceOf(_msgSender()));
-        _checkAndExecuteWithdraw();
+        currentProposalId++;
+        activeProposal = true;
+        proposalDetails[currentProposalId] = abi.encode(true, balanceOf(_msgSender()), tokenAddr, _msgSender(), block.timestamp + PROPOSAL_DURATION);
+        proposalTypes[currentProposalId] = ProposalType.Withdraw;
+        hasVoted[currentProposalId][_msgSender()] = true;
+        emit ProposalInitiated("Withdraw", currentProposalId, _msgSender());
+        emit Voted("Withdraw", currentProposalId, _msgSender(), balanceOf(_msgSender()));
+        _checkAndExecuteWithdraw(currentProposalId);
     }
 
     /**
@@ -400,14 +297,19 @@ contract Share is ERC20, ReentrancyGuard {
      * @dev Requires an active proposal, valid deadline, holder of SHARE tokens, and not already voted.
      */
     function voteAdd() external nonReentrant {
-        if (!recentAdd.voting) revert NoOngoingProposal("Add");
-        if (block.timestamp > recentAdd.deadline) revert ProposalExpired();
+        uint256 id = currentProposalId;
+        if (proposalTypes[id] != ProposalType.Add) revert NoOngoingProposal("Add");
+        bytes memory data = proposalDetails[id];
+        (bool voting, uint256 votingPower, uint256 printQuota, address merchantAddr, string memory merchantName, uint256 deadline) = abi.decode(data, (bool, uint256, uint256, address, string, uint256));
+        if (!voting) revert NoOngoingProposal("Add");
+        if (block.timestamp > deadline) revert ProposalExpired();
         if (balanceOf(_msgSender()) == 0) revert MustHoldShareTokens();
-        if (hasVoted[proposalId][_msgSender()]) revert AlreadyVoted();
-        hasVoted[proposalId][_msgSender()] = true;
-        recentAdd.votingPower += balanceOf(_msgSender());
-        emit Voted("Add", proposalId, _msgSender(), balanceOf(_msgSender()));
-        _checkAndExecuteAdd();
+        if (hasVoted[id][_msgSender()]) revert AlreadyVoted();
+        hasVoted[id][_msgSender()] = true;
+        votingPower += balanceOf(_msgSender());
+        proposalDetails[id] = abi.encode(voting, votingPower, printQuota, merchantAddr, merchantName, deadline);
+        emit Voted("Add", id, _msgSender(), balanceOf(_msgSender()));
+        _checkAndExecuteAdd(id);
     }
 
     /**
@@ -415,14 +317,19 @@ contract Share is ERC20, ReentrancyGuard {
      * @dev Requires an active proposal, valid deadline, holder of SHARE tokens, and not already voted.
      */
     function voteMod() external nonReentrant {
-        if (!recentMod.voting) revert NoOngoingProposal("Mod");
-        if (block.timestamp > recentMod.deadline) revert ProposalExpired();
+        uint256 id = currentProposalId;
+        if (proposalTypes[id] != ProposalType.Mod) revert NoOngoingProposal("Mod");
+        bytes memory data = proposalDetails[id];
+        (bool voting, uint256 votingPower, uint256 printQuota, uint256 spendingRebate, address merchantAddr, address newGuardian, bool isFreeze, uint256 deadline) = abi.decode(data, (bool, uint256, uint256, uint256, address, address, bool, uint256));
+        if (!voting) revert NoOngoingProposal("Mod");
+        if (block.timestamp > deadline) revert ProposalExpired();
         if (balanceOf(_msgSender()) == 0) revert MustHoldShareTokens();
-        if (hasVoted[proposalId][_msgSender()]) revert AlreadyVoted();
-        hasVoted[proposalId][_msgSender()] = true;
-        recentMod.votingPower += balanceOf(_msgSender());
-        emit Voted("Mod", proposalId, _msgSender(), balanceOf(_msgSender()));
-        _checkAndExecuteMod();
+        if (hasVoted[id][_msgSender()]) revert AlreadyVoted();
+        hasVoted[id][_msgSender()] = true;
+        votingPower += balanceOf(_msgSender());
+        proposalDetails[id] = abi.encode(voting, votingPower, printQuota, spendingRebate, merchantAddr, newGuardian, isFreeze, deadline);
+        emit Voted("Mod", id, _msgSender(), balanceOf(_msgSender()));
+        _checkAndExecuteMod(id);
     }
 
     /**
@@ -430,14 +337,19 @@ contract Share is ERC20, ReentrancyGuard {
      * @dev Requires an active proposal, valid deadline, holder of SHARE tokens, and not already voted.
      */
     function voteChange() external nonReentrant {
-        if (!recentChange.voting) revert NoOngoingProposal("Change");
-        if (block.timestamp > recentChange.deadline) revert ProposalExpired();
+        uint256 id = currentProposalId;
+        if (proposalTypes[id] != ProposalType.Change) revert NoOngoingProposal("Change");
+        bytes memory data = proposalDetails[id];
+        (bool voting, uint256 deadline, uint256 votingPower, uint8 newPercentage) = abi.decode(data, (bool, uint256, uint256, uint8));
+        if (!voting) revert NoOngoingProposal("Change");
+        if (block.timestamp > deadline) revert ProposalExpired();
         if (balanceOf(_msgSender()) == 0) revert MustHoldShareTokens();
-        if (hasVoted[proposalId][_msgSender()]) revert AlreadyVoted();
-        hasVoted[proposalId][_msgSender()] = true;
-        recentChange.votingPower += balanceOf(_msgSender());
-        emit Voted("Change", proposalId, _msgSender(), balanceOf(_msgSender()));
-        _checkAndExecuteChange();
+        if (hasVoted[id][_msgSender()]) revert AlreadyVoted();
+        hasVoted[id][_msgSender()] = true;
+        votingPower += balanceOf(_msgSender());
+        proposalDetails[id] = abi.encode(voting, deadline, votingPower, newPercentage);
+        emit Voted("Change", id, _msgSender(), balanceOf(_msgSender()));
+        _checkAndExecuteChange(id);
     }
 
     /**
@@ -445,103 +357,116 @@ contract Share is ERC20, ReentrancyGuard {
      * @dev Requires an active proposal, valid deadline, holder of SHARE tokens, and not already voted.
      */
     function voteWithdraw() external nonReentrant {
-        if (!recentWithdraw.voting) revert NoOngoingProposal("Withdraw");
-        if (block.timestamp > recentWithdraw.deadline) revert ProposalExpired();
+        uint256 id = currentProposalId;
+        if (proposalTypes[id] != ProposalType.Withdraw) revert NoOngoingProposal("Withdraw");
+        bytes memory data = proposalDetails[id];
+        (bool voting, uint256 votingPower, address tokenAddr, address initiator, uint256 deadline) = abi.decode(data, (bool, uint256, address, address, uint256));
+        if (!voting) revert NoOngoingProposal("Withdraw");
+        if (block.timestamp > deadline) revert ProposalExpired();
         if (balanceOf(_msgSender()) == 0) revert MustHoldShareTokens();
-        if (hasVoted[proposalId][_msgSender()]) revert AlreadyVoted();
-        hasVoted[proposalId][_msgSender()] = true;
-        recentWithdraw.votingPower += balanceOf(_msgSender());
-        emit Voted("Withdraw", proposalId, _msgSender(), balanceOf(_msgSender()));
-        _checkAndExecuteWithdraw();
+        if (hasVoted[id][_msgSender()]) revert AlreadyVoted();
+        hasVoted[id][_msgSender()] = true;
+        votingPower += balanceOf(_msgSender());
+        proposalDetails[id] = abi.encode(voting, votingPower, tokenAddr, initiator, deadline);
+        emit Voted("Withdraw", id, _msgSender(), balanceOf(_msgSender()));
+        _checkAndExecuteWithdraw(id);
     }
 
     /**
      * @notice Internal function to check and execute the add merchant proposal if threshold met.
      * @dev Called after votes; mints 0.n% SHARE to new merchant if passed, where n is the current multiplier.
+     * @param id The proposal ID.
      */
-    function _checkAndExecuteAdd() private {
+    function _checkAndExecuteAdd(uint256 id) private {
         if (totalSupply() == 0) revert TotalSupplyZero();
-        if (block.timestamp > recentAdd.deadline) {
+        bytes memory data = proposalDetails[id];
+        (, uint256 votingPower, uint256 printQuota, address merchantAddr, string memory merchantName, uint256 deadline) = abi.decode(data, (bool, uint256, uint256, address, string, uint256));
+        if (block.timestamp > deadline) {
             return; // Prevent execution if expired
         }
         uint256 threshold = (totalSupply() * majorityPercentage) / 100;
-        if (recentAdd.votingPower >= threshold) {
-            addMerchant(recentAdd.printQuota, recentAdd.merchantAddr, recentAdd.merchantName);
-            recentAdd.voting = false;
-            currentProposalType = ProposalType.None;
-            _mint(recentAdd.merchantAddr, totalSupply() / 1000 * n); // mint 0.n% $share of the totalsupply to new merchant, using current n multiplier
-            emit ProposalExecuted("Add", proposalId);
-            emit ProposalEnded("Add", proposalId, true);
+        if (votingPower >= threshold) {
+            addMerchant(printQuota, merchantAddr, merchantName);
+            proposalDetails[id] = abi.encode(false, votingPower, printQuota, merchantAddr, merchantName, deadline);
+            activeProposal = false;
+            emit ProposalExecuted("Add", id);
+            emit ProposalEnded("Add", id, true);
         }
     }
 
     /**
      * @notice Internal function to check and execute the modify merchant proposal if threshold met.
      * @dev Called after votes.
+     * @param id The proposal ID.
      */
-    function _checkAndExecuteMod() private {
+    function _checkAndExecuteMod(uint256 id) private {
         if (totalSupply() == 0) revert TotalSupplyZero();
-        if (block.timestamp > recentMod.deadline) {
+        bytes memory data = proposalDetails[id];
+        (, uint256 votingPower, uint256 printQuota, uint256 spendingRebate, address merchantAddr, address newGuardian, bool isFreeze, uint256 deadline) = abi.decode(data, (bool, uint256, uint256, uint256, address, address, bool, uint256));
+        if (block.timestamp > deadline) {
             return; // Prevent execution if expired
         }
         uint256 threshold = (totalSupply() * majorityPercentage) / 100;
-        if (recentMod.votingPower >= threshold) {
-            modMerchant(recentMod.merchantAddr, recentMod.newGuardian, recentMod.isFreeze, recentMod.printQuota, recentMod.spendingRebate);
-            recentMod.voting = false;
-            currentProposalType = ProposalType.None;
-            emit ProposalExecuted("Mod", proposalId);
-            emit ProposalEnded("Mod", proposalId, true);
+        if (votingPower >= threshold) {
+            modMerchant(merchantAddr, newGuardian, isFreeze, printQuota, spendingRebate);
+            proposalDetails[id] = abi.encode(false, votingPower, printQuota, spendingRebate, merchantAddr, newGuardian, isFreeze, deadline);
+            activeProposal = false;
+            emit ProposalExecuted("Mod", id);
+            emit ProposalEnded("Mod", id, true);
         }
     }
 
     /**
      * @notice Internal function to check and execute the change percentage proposal if threshold met.
      * @dev Called after votes; updates majorityPercentage and n if the proposal passes.
+     * @param id The proposal ID.
      */
-    function _checkAndExecuteChange() private {
+    function _checkAndExecuteChange(uint256 id) private {
         if (totalSupply() == 0) revert TotalSupplyZero();
-        if (block.timestamp > recentChange.deadline) {
+        bytes memory data = proposalDetails[id];
+        (, uint256 deadline, uint256 votingPower, uint8 newPercentage) = abi.decode(data, (bool, uint256, uint256, uint8));
+        if (block.timestamp > deadline) {
             return; // Prevent execution if expired
         }
         uint256 threshold = (totalSupply() * majorityPercentage) / 100;
-        if (recentChange.votingPower >= threshold) {
-            majorityPercentage = recentChange.newPercentage; // Update the majority percentage required for proposals
-            n = recentChange.newN; // Update the minting multiplier for new merchants
-            recentChange.voting = false;
-            currentProposalType = ProposalType.None;
-            emit ProposalExecuted("Change", proposalId);
-            emit ProposalEnded("Change", proposalId, true);
+        if (votingPower >= threshold) {
+            majorityPercentage = newPercentage;
+            proposalDetails[id] = abi.encode(false, deadline, votingPower, newPercentage);
+            activeProposal = false;
+            emit ProposalExecuted("Change", id);
+            emit ProposalEnded("Change", id, true);
         }
     }
 
     /**
      * @notice Internal function to check and execute the withdraw proposal if threshold met.
      * @dev Called after votes; withdraws tokens/ETH to initiator.
+     * @param id The proposal ID.
      */
-    function _checkAndExecuteWithdraw() private {
+    function _checkAndExecuteWithdraw(uint256 id) private {
         if (totalSupply() == 0) revert TotalSupplyZero();
-        if (block.timestamp > recentWithdraw.deadline) {
+        bytes memory data = proposalDetails[id];
+        (, uint256 votingPower, address tokenAddr, address initiator, uint256 deadline) = abi.decode(data, (bool, uint256, address, address, uint256));
+        if (block.timestamp > deadline) {
             return; // Prevent execution if expired
         }
         uint256 threshold = (totalSupply() * majorityPercentage) / 100;
-        if (recentWithdraw.votingPower >= threshold) {
-            address token = recentWithdraw.tokenAddr;
-            address initiator = recentWithdraw.initiator;
-            IToken(TOKEN_ADDRESS).withdrawTokensAndETH(token);
-            if (token == address(0)) {
+        if (votingPower >= threshold) {
+            IToken(TOKEN_ADDRESS).withdrawTokensAndETH(tokenAddr);
+            if (tokenAddr == address(0)) {
                 if (address(this).balance > 0) {
                     Address.sendValue(payable(initiator), address(this).balance);
                 }
             } else {
-                uint256 balance = IERC20(token).balanceOf(address(this));
+                uint256 balance = IERC20(tokenAddr).balanceOf(address(this));
                 if (balance > 0) {
-                    IERC20(token).transfer(initiator, balance);
+                    IERC20(tokenAddr).transfer(initiator, balance);
                 }
             }
-            recentWithdraw.voting = false;
-            currentProposalType = ProposalType.None;
-            emit ProposalExecuted("Withdraw", proposalId);
-            emit ProposalEnded("Withdraw", proposalId, true);
+            proposalDetails[id] = abi.encode(false, votingPower, tokenAddr, initiator, deadline);
+            activeProposal = false;
+            emit ProposalExecuted("Withdraw", id);
+            emit ProposalEnded("Withdraw", id, true);
         }
     }
 
@@ -581,14 +506,85 @@ contract Share is ERC20, ReentrancyGuard {
 
     /**
      * @notice Checks if any proposal is currently active.
-     * @dev View function checking all proposal types.
-     * @return True if any active, false otherwise.
+     * @dev View function checking the active proposal's status.
+     * @return True if active and not expired, false otherwise.
      */
     function isAnyProposalActive() public view returns (bool) {
-        return (recentAdd.voting && block.timestamp <= recentAdd.deadline) ||
-               (recentMod.voting && block.timestamp <= recentMod.deadline) ||
-               (recentChange.voting && block.timestamp <= recentChange.deadline) ||
-               (recentWithdraw.voting && block.timestamp <= recentWithdraw.deadline);
+        if (currentProposalId == 0) return false;
+        bytes memory data = proposalDetails[currentProposalId];
+        if (data.length == 0) return false;
+        ProposalType pt = proposalTypes[currentProposalId];
+        if (pt == ProposalType.Add) {
+            (bool voting, , , , , uint256 deadline) = abi.decode(data, (bool, uint256, uint256, address, string, uint256));
+            return voting && block.timestamp <= deadline;
+        } else if (pt == ProposalType.Mod) {
+            (bool voting, , , , , , , uint256 deadline) = abi.decode(data, (bool, uint256, uint256, uint256, address, address, bool, uint256));
+            return voting && block.timestamp <= deadline;
+        } else if (pt == ProposalType.Change) {
+            (bool voting, uint256 deadline, ,) = abi.decode(data, (bool, uint256, uint256, uint8));
+            return voting && block.timestamp <= deadline;
+        } else if (pt == ProposalType.Withdraw) {
+            (bool voting, , , , uint256 deadline) = abi.decode(data, (bool, uint256, address, address, uint256));
+            return voting && block.timestamp <= deadline;
+        }
+        return false;
+    }
+
+    /**
+     * @notice Returns the type of a proposal by ID.
+     * @param id The proposal ID.
+     * @return The ProposalType enum value.
+     */
+    function getProposalType(uint256 id) external view returns (ProposalType) {
+        return proposalTypes[id];
+    }
+
+    /**
+     * @notice Returns the add proposal data for a given ID.
+     * @dev Reverts if the proposal is not of Add type.
+     * @param id The proposal ID.
+     * @return voting Whether active, votingPower Accumulated votes, printQuota Quota, merchantAddr Address, merchantName Name, deadline Expiration.
+     */
+    function getAddProposal(uint256 id) external view returns (bool voting, uint256 votingPower, uint256 printQuota, address merchantAddr, string memory merchantName, uint256 deadline) {
+        if (proposalTypes[id] != ProposalType.Add) revert WrongProposalType();
+        bytes memory data = proposalDetails[id];
+        return abi.decode(data, (bool, uint256, uint256, address, string, uint256));
+    }
+
+    /**
+     * @notice Returns the mod proposal data for a given ID.
+     * @dev Reverts if the proposal is not of Mod type.
+     * @param id The proposal ID.
+     * @return voting Whether active, votingPower Accumulated votes, printQuota Quota, spendingRebate Rebate, merchantAddr Address, newGuardian Guardian, isFreeze Freeze status, deadline Expiration.
+     */
+    function getModProposal(uint256 id) external view returns (bool voting, uint256 votingPower, uint256 printQuota, uint256 spendingRebate, address merchantAddr, address newGuardian, bool isFreeze, uint256 deadline) {
+        if (proposalTypes[id] != ProposalType.Mod) revert WrongProposalType();
+        bytes memory data = proposalDetails[id];
+        return abi.decode(data, (bool, uint256, uint256, uint256, address, address, bool, uint256));
+    }
+
+    /**
+     * @notice Returns the change proposal data for a given ID.
+     * @dev Reverts if the proposal is not of Change type.
+     * @param id The proposal ID.
+     * @return voting Whether active, deadline Expiration, votingPower Accumulated votes, newPercentage New percentage, newN New multiplier.
+     */
+    function getChangeProposal(uint256 id) external view returns (bool voting, uint256 deadline, uint256 votingPower, uint8 newPercentage) {
+        if (proposalTypes[id] != ProposalType.Change) revert WrongProposalType();
+        bytes memory data = proposalDetails[id];
+        return abi.decode(data, (bool, uint256, uint256, uint8));
+    }
+
+    /**
+     * @notice Returns the withdraw proposal data for a given ID.
+     * @dev Reverts if the proposal is not of Withdraw type.
+     * @param id The proposal ID.
+     * @return voting Whether active, votingPower Accumulated votes, tokenAddr Token address, initiator Initiator, deadline Expiration.
+     */
+    function getWithdrawProposal(uint256 id) external view returns (bool voting, uint256 votingPower, address tokenAddr, address initiator, uint256 deadline) {
+        if (proposalTypes[id] != ProposalType.Withdraw) revert WrongProposalType();
+        bytes memory data = proposalDetails[id];
+        return abi.decode(data, (bool, uint256, address, address, uint256));
     }
 
     /**
